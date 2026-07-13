@@ -1,29 +1,41 @@
-"""
-Dissolved Oxygen Prediction System
-Streamlit Cloud entry point — compatible with any package version.
-"""
-import sys, os, traceback
+import sys
+import os
+
+# ── Path setup (must be first) ────────────────────────────────────────────────
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
-import numpy as np
-import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+# ── Streamlit MUST be imported before anything else ───────────────────────────
 import streamlit as st
 
-# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Dissolved Oxygen Predictor",
     page_icon="💧",
     layout="wide",
 )
+
+# ── All other imports deferred — prevents startup crash on cloud ──────────────
+import traceback
+import io
+import json
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+
+# matplotlib backend must be set before pyplot import
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ── Styling ───────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 .stApp {background: linear-gradient(180deg,#f0f8ff,#ffffff);}
 h1,h2,h3 {color:#07204a;}
-</style>""", unsafe_allow_html=True)
+</style>
+""", unsafe_allow_html=True)
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.title("💧 Dissolved Oxygen Prediction System")
@@ -50,13 +62,90 @@ with st.sidebar:
     threshold = st.slider("Alert threshold (mg/L)", 2.0, 8.0, 5.0, 0.5)
     show_raw  = st.checkbox("Show raw data preview", value=False)
 
-# ── Load model once ───────────────────────────────────────────────────────────
+# ── Model loader (cached, loaded once per session) ────────────────────────────
 @st.cache_resource(show_spinner="Loading model...")
 def load_model():
-    from predict import load_artifacts
-    return load_artifacts()
+    import onnxruntime as rt
+    model_path    = os.path.join(ROOT, "models", "bisru_model.onnx")
+    features_path = os.path.join(ROOT, "models", "selected_features.json")
+    scaler_min    = os.path.join(ROOT, "models", "scaler_min.npy")
+    scaler_scale  = os.path.join(ROOT, "models", "scaler_scale.npy")
 
-# ── No file uploaded ──────────────────────────────────────────────────────────
+    sess       = rt.InferenceSession(model_path)
+    data_min   = np.load(scaler_min)
+    scale      = np.load(scaler_scale)
+    with open(features_path) as f:
+        features = json.load(f)
+    return sess, (data_min, scale), features
+
+# ── Prediction function ───────────────────────────────────────────────────────
+SEQUENCE_LEN = 24
+DO_THRESHOLD = 5.0
+ALL_FEATURES = ["temperature", "pH", "BOD", "ammonia", "nitrate", "nitrogen"]
+SCALER_COLS  = ALL_FEATURES + ["dissolved_oxygen"]
+COL_MAP = {
+    "Temperature (cel)"                : "temperature",
+    "pH (ph units)"                    : "pH",
+    "Biochemical Oxygen Demand (mg/l)" : "BOD",
+    "Ammonia (mg/l)"                   : "ammonia",
+    "Nitrate (mg/l)"                   : "nitrate",
+    "Nitrogen (mg/l)"                  : "nitrogen",
+    "Dissolved Oxygen (mg/l)"          : "dissolved_oxygen",
+}
+
+def run_prediction(file_bytes, model, scaler, features, threshold):
+    data_min, scale = scaler
+    TARGET = "dissolved_oxygen"
+
+    df = pd.read_csv(io.BytesIO(file_bytes), low_memory=False)
+    df = df.rename(columns=COL_MAP)
+
+    has_target = TARGET in df.columns
+    needed = ALL_FEATURES + ([TARGET] if has_target else [])
+    df = df[[c for c in needed if c in df.columns]].copy()
+
+    for col in ALL_FEATURES:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = df[col].fillna(float(df[col].median()))
+
+    if len(df) < SEQUENCE_LEN + 1:
+        raise ValueError(
+            f"Need at least {SEQUENCE_LEN + 1} rows. Got {len(df)}. "
+            "Please upload a larger CSV file (at least 25 rows of sensor data)."
+        )
+
+    cols_present = ALL_FEATURES + ([TARGET] if has_target else [])
+    arr = df[cols_present].values.astype(np.float64)
+    for i, col in enumerate(cols_present):
+        idx = SCALER_COLS.index(col)
+        arr[:, i] = (arr[:, i] - data_min[idx]) * scale[idx]
+
+    feat_idx = [cols_present.index(f) for f in features]
+    feat_arr = arr[:, feat_idx].astype(np.float32)
+    X = np.stack([feat_arr[i: i + SEQUENCE_LEN]
+                  for i in range(len(feat_arr) - SEQUENCE_LEN)]).astype(np.float32)
+
+    inp_name   = model.get_inputs()[0].name
+    preds_norm = model.run(None, {inp_name: X})[0].flatten()
+
+    do_idx    = SCALER_COLS.index(TARGET)
+    preds_mgL = preds_norm / scale[do_idx] + data_min[do_idx]
+
+    result = pd.DataFrame({
+        "index"        : np.arange(len(preds_mgL)),
+        "predicted_DO" : np.round(preds_mgL.astype(float), 3),
+        "alert"        : preds_mgL < threshold,
+    })
+
+    if has_target:
+        do_col = cols_present.index(TARGET)
+        actual = arr[SEQUENCE_LEN:, do_col] / scale[do_idx] + data_min[do_idx]
+        result["actual_DO"] = np.round(actual.astype(float), 3)
+
+    return result
+
+# ── No file ───────────────────────────────────────────────────────────────────
 if uploaded is None:
     st.info("👈 Upload a CSV file from the sidebar to get started.")
     with st.expander("ℹ️ About this app"):
@@ -69,7 +158,8 @@ if uploaded is None:
 - Trained on aquaculture sensor data
 
 **Feature selection**
-- LightGBM selects top 4 features from: temperature, pH, BOD, ammonia, nitrate, nitrogen
+- LightGBM selects top 4 features
+- From: temperature, pH, BOD, ammonia, nitrate, nitrogen
 """)
         with c2:
             st.markdown("""
@@ -84,22 +174,17 @@ if uploaded is None:
 """)
     st.stop()
 
-# ── Run prediction ────────────────────────────────────────────────────────────
-file_bytes = uploaded.getvalue()
-
+# ── Load model & predict ──────────────────────────────────────────────────────
 try:
     model, scaler, features = load_model()
 except Exception as e:
-    st.error(f"❌ Failed to load model: {e}")
+    st.error(f"❌ Model load failed: {e}")
     st.code(traceback.format_exc())
     st.stop()
 
 try:
-    from predict import predict
     with st.spinner("Running prediction..."):
-        result = predict(file_bytes, model=model, scaler=scaler, features=features)
-    result = result.copy()
-    result["alert"] = result["predicted_DO"] < threshold
+        result = run_prediction(uploaded.getvalue(), model, scaler, features, threshold)
 except ValueError as e:
     st.error(f"❌ {e}")
     st.stop()
@@ -111,8 +196,10 @@ except Exception as e:
 # ── Raw preview ───────────────────────────────────────────────────────────────
 if show_raw:
     with st.expander("📄 Uploaded data preview"):
-        import io
-        st.dataframe(pd.read_csv(io.BytesIO(file_bytes)).head(50), use_container_width=True)
+        st.dataframe(
+            pd.read_csv(io.BytesIO(uploaded.getvalue())).head(50),
+            use_container_width=True
+        )
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
 alerts   = int(result["alert"].sum())
@@ -133,9 +220,9 @@ c5.metric("🚨 Alerts", f"{alerts:,}",
 st.divider()
 
 if alerts > 0:
-    st.error(f"⚠️ **{alerts} readings** predicted below **{threshold} mg/L**. Immediate action may be required.")
+    st.error(f"⚠️ **{alerts} readings** predicted below **{threshold} mg/L**.")
 else:
-    st.success(f"✅ All {total:,} predictions are within the safe range (≥ {threshold} mg/L).")
+    st.success(f"✅ All {total:,} predictions within safe range (≥ {threshold} mg/L).")
 
 st.divider()
 
@@ -145,13 +232,13 @@ plot_df = result.reset_index(drop=True).iloc[:500]
 col1, col2 = st.columns([2, 1])
 
 with col1:
-    st.subheader("📈 Dissolved Oxygen Trend")
+    st.subheader("📈 DO Trend")
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(plot_df.index, plot_df["predicted_DO"], label="Predicted DO",
-            color="#1565C0", linewidth=1.8)
+    ax.plot(plot_df.index, plot_df["predicted_DO"],
+            label="Predicted DO", color="#1565C0", linewidth=1.8)
     if "actual_DO" in plot_df.columns:
-        ax.plot(plot_df.index, plot_df["actual_DO"], label="Actual DO",
-                color="#E65100", linewidth=1.4, alpha=0.8)
+        ax.plot(plot_df.index, plot_df["actual_DO"],
+                label="Actual DO", color="#E65100", linewidth=1.4, alpha=0.8)
     ax.axhline(threshold, color="#C62828", linestyle="--", linewidth=1.2,
                label=f"Threshold ({threshold} mg/L)")
     ax.fill_between(plot_df.index, 0, threshold, color="#FFCDD2", alpha=0.3)
@@ -159,7 +246,7 @@ with col1:
     ax.set_ylabel("DO (mg/L)")
     ax.set_title("Predicted Dissolved Oxygen Over Time")
     ax.legend(frameon=False)
-    ax.spines[["top","right"]].set_visible(False)
+    ax.spines[["top", "right"]].set_visible(False)
     plt.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
@@ -167,13 +254,13 @@ with col1:
 with col2:
     st.subheader("📊 Distribution")
     fig2, ax2 = plt.subplots(figsize=(5, 4))
-    ax2.hist(plot_df["predicted_DO"], bins=25, color="#1E88E5", alpha=0.85, edgecolor="white")
-    ax2.axvline(threshold, color="#C62828", linestyle="--", linewidth=1.2, label="Threshold")
+    ax2.hist(plot_df["predicted_DO"], bins=25,
+             color="#1E88E5", alpha=0.85, edgecolor="white")
+    ax2.axvline(threshold, color="#C62828", linestyle="--", linewidth=1.2)
     ax2.set_xlabel("Predicted DO (mg/L)")
     ax2.set_ylabel("Count")
     ax2.set_title("DO Distribution")
-    ax2.legend(frameon=False)
-    ax2.spines[["top","right"]].set_visible(False)
+    ax2.spines[["top", "right"]].set_visible(False)
     plt.tight_layout()
     st.pyplot(fig2)
     plt.close(fig2)
@@ -183,13 +270,13 @@ if "actual_DO" in result.columns:
     fig3, ax3 = plt.subplots(figsize=(5, 4))
     ax3.scatter(plot_df["actual_DO"], plot_df["predicted_DO"],
                 alpha=0.4, s=15, color="#1E88E5")
-    mn = min(plot_df["actual_DO"].min(), plot_df["predicted_DO"].min())
-    mx = max(plot_df["actual_DO"].max(), plot_df["predicted_DO"].max())
+    mn = min(float(plot_df["actual_DO"].min()), float(plot_df["predicted_DO"].min()))
+    mx = max(float(plot_df["actual_DO"].max()), float(plot_df["predicted_DO"].max()))
     ax3.plot([mn, mx], [mn, mx], "r--", linewidth=1)
     ax3.set_xlabel("Actual DO (mg/L)")
     ax3.set_ylabel("Predicted DO (mg/L)")
     ax3.set_title("Actual vs Predicted")
-    ax3.spines[["top","right"]].set_visible(False)
+    ax3.spines[["top", "right"]].set_visible(False)
     plt.tight_layout()
     _, sc, _ = st.columns([1, 2, 1])
     with sc:
@@ -206,7 +293,7 @@ if os.path.exists(img_path):
         with ic:
             st.image(img_path, caption="LightGBM feature importance")
 
-# ── Predictions table ─────────────────────────────────────────────────────────
+# ── Table ─────────────────────────────────────────────────────────────────────
 st.subheader("📋 Predictions Table")
 disp = result.copy()
 disp["status"] = disp["alert"].map({True: "⚠️ Alert", False: "✅ Safe"})
