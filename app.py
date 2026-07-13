@@ -12,7 +12,6 @@ SRC  = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
-import threading
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt

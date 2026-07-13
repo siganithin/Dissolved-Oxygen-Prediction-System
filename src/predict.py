@@ -2,28 +2,26 @@ import numpy as np
 import pandas as pd
 import joblib
 import os
-from model import SEQUENCE_LEN, SumOverTime
+import onnxruntime as rt
 
-# Get the project root directory (parent of src/)
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Project root (parent of src/)
+PROJECT_ROOT  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-MODEL_PATH    = os.path.join(PROJECT_ROOT, "models/bisru_model.keras")
-SCALER_PATH   = os.path.join(PROJECT_ROOT, "models/scaler.pkl")
-FEATURES_PATH = os.path.join(PROJECT_ROOT, "models/selected_features.pkl")
+MODEL_PATH    = os.path.join(PROJECT_ROOT, "models", "bisru_model.onnx")
+SCALER_PATH   = os.path.join(PROJECT_ROOT, "models", "scaler.pkl")
+FEATURES_PATH = os.path.join(PROJECT_ROOT, "models", "selected_features.pkl")
+
 TARGET        = "dissolved_oxygen"
 DO_THRESHOLD  = 5.0
-
 ALL_FEATURES  = ["temperature", "pH", "BOD", "ammonia", "nitrate", "nitrogen"]
+SEQUENCE_LEN  = 24
 
 
 def load_artifacts():
-    # Defer heavy TensorFlow import until actually loading the model
-    from tensorflow.keras.models import load_model
-
-    model = load_model(MODEL_PATH, custom_objects={"SumOverTime": SumOverTime})
-    scaler = joblib.load(SCALER_PATH)
+    sess     = rt.InferenceSession(MODEL_PATH)
+    scaler   = joblib.load(SCALER_PATH)
     features = joblib.load(FEATURES_PATH)
-    return model, scaler, features
+    return sess, scaler, features
 
 
 def preprocess_upload(df: pd.DataFrame, scaler, features: list) -> pd.DataFrame:
@@ -48,11 +46,9 @@ def preprocess_upload(df: pd.DataFrame, scaler, features: list) -> pd.DataFrame:
     return df
 
 
-def make_sequences(df: pd.DataFrame, features: list):
-    X = []
+def make_sequences(df: pd.DataFrame, features: list) -> np.ndarray:
     values = df[features].values
-    for i in range(len(df) - SEQUENCE_LEN):
-        X.append(values[i : i + SEQUENCE_LEN])
+    X = [values[i: i + SEQUENCE_LEN] for i in range(len(df) - SEQUENCE_LEN)]
     return np.array(X, dtype="float32")
 
 
@@ -73,9 +69,12 @@ def predict(csv_path: str, model=None, scaler=None, features=None) -> pd.DataFra
     if len(df) < SEQUENCE_LEN + 1:
         raise ValueError(f"Need at least {SEQUENCE_LEN + 1} rows. Got {len(df)}.")
 
-    X          = make_sequences(df, features)
-    preds_norm = model.predict(X, verbose=0).flatten()
-    preds_mgL  = inverse_do(scaler, preds_norm)
+    X = make_sequences(df, features)
+
+    # ONNX inference — input name is 'input'
+    input_name  = model.get_inputs()[0].name
+    preds_norm  = model.run(None, {input_name: X})[0].flatten()
+    preds_mgL   = inverse_do(scaler, preds_norm)
 
     actual_col = df[TARGET].values[SEQUENCE_LEN:] if TARGET in df.columns else None
     actual_mgL = inverse_do(scaler, actual_col) if actual_col is not None else None
@@ -92,9 +91,11 @@ def predict(csv_path: str, model=None, scaler=None, features=None) -> pd.DataFra
 
 
 if __name__ == "__main__":
-    # Sample 500 rows from raw data for a clean end-to-end test
-    raw = pd.read_csv("data/raw/aquaculture_data.csv", low_memory=False).dropna().head(500)
-    sample_path = "data/processed/sample_test.csv"
+    raw = pd.read_csv(
+        os.path.join(PROJECT_ROOT, "data", "raw", "aquaculture_data.csv"),
+        low_memory=False
+    ).dropna().head(500)
+    sample_path = os.path.join(PROJECT_ROOT, "data", "processed", "sample_test.csv")
     raw.to_csv(sample_path, index=False)
 
     result = predict(sample_path)
