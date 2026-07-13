@@ -80,13 +80,8 @@ def get_model():
 
 @st.cache_data(show_spinner=False)
 def run_prediction(file_bytes: bytes) -> pd.DataFrame:
-    tmp_dir  = os.path.join(ROOT, "src", "data", "processed")
-    tmp_path = os.path.join(tmp_dir, "_upload_tmp.csv")
-    os.makedirs(tmp_dir, exist_ok=True)
-    with open(tmp_path, "wb") as f:
-        f.write(file_bytes)
     model, scaler, features = get_model()
-    return predict(tmp_path, model=model, scaler=scaler, features=features)
+    return predict(file_bytes, model=model, scaler=scaler, features=features)
 
 
 # ── No file state ─────────────────────────────────────────────────────────────

@@ -1,8 +1,11 @@
+import io
+import os
 import numpy as np
 import pandas as pd
 import joblib
-import os
 import onnxruntime as rt
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)  # suppress sklearn version warnings
 
 # Project root (parent of src/)
 PROJECT_ROOT  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,6 +19,17 @@ DO_THRESHOLD  = 5.0
 ALL_FEATURES  = ["temperature", "pH", "BOD", "ammonia", "nitrate", "nitrogen"]
 SEQUENCE_LEN  = 24
 
+COL_MAP = {
+    "Temperature (cel)"                : "temperature",
+    "pH (ph units)"                    : "pH",
+    "Biochemical Oxygen Demand (mg/l)" : "BOD",
+    "Ammonia (mg/l)"                   : "ammonia",
+    "Nitrate (mg/l)"                   : "nitrate",
+    "Nitrogen (mg/l)"                  : "nitrogen",
+    "Dissolved Oxygen (mg/l)"          : "dissolved_oxygen",
+    "Date"                             : "timestamp",
+}
+
 
 def load_artifacts():
     sess     = rt.InferenceSession(MODEL_PATH)
@@ -24,57 +38,61 @@ def load_artifacts():
     return sess, scaler, features
 
 
-def preprocess_upload(df: pd.DataFrame, scaler, features: list) -> pd.DataFrame:
-    col_map = {
-        "Temperature (cel)"                : "temperature",
-        "pH (ph units)"                    : "pH",
-        "Biochemical Oxygen Demand (mg/l)" : "BOD",
-        "Ammonia (mg/l)"                   : "ammonia",
-        "Nitrate (mg/l)"                   : "nitrate",
-        "Nitrogen (mg/l)"                  : "nitrogen",
-        "Dissolved Oxygen (mg/l)"          : "dissolved_oxygen",
-        "Date"                             : "timestamp",
-    }
-    df = df.rename(columns=col_map)
+def _load_csv(source) -> pd.DataFrame:
+    """Accept a file path (str), bytes, or file-like object."""
+    if isinstance(source, (str, os.PathLike)):
+        return pd.read_csv(source, low_memory=False)
+    if isinstance(source, bytes):
+        return pd.read_csv(io.BytesIO(source), low_memory=False)
+    return pd.read_csv(source, low_memory=False)
 
+
+def preprocess(df: pd.DataFrame, scaler, features: list) -> pd.DataFrame:
+    df = df.rename(columns=COL_MAP).copy()
     needed = ALL_FEATURES + ([TARGET] if TARGET in df.columns else [])
-    df = df[[c for c in needed if c in df.columns]]
+    df = df[[c for c in needed if c in df.columns]].copy()
     df[ALL_FEATURES] = df[ALL_FEATURES].fillna(df[ALL_FEATURES].median())
-
-    cols_to_scale = ALL_FEATURES + ([TARGET] if TARGET in df.columns else [])
-    df[cols_to_scale] = scaler.transform(df[cols_to_scale])
+    cols = ALL_FEATURES + ([TARGET] if TARGET in df.columns else [])
+    scaled = scaler.transform(df[cols])
+    df = df.copy()
+    df[cols] = scaled
     return df
 
 
 def make_sequences(df: pd.DataFrame, features: list) -> np.ndarray:
     values = df[features].values
-    X = [values[i: i + SEQUENCE_LEN] for i in range(len(df) - SEQUENCE_LEN)]
-    return np.array(X, dtype="float32")
+    return np.array(
+        [values[i: i + SEQUENCE_LEN] for i in range(len(df) - SEQUENCE_LEN)],
+        dtype="float32"
+    )
 
 
 def inverse_do(scaler, values: np.ndarray) -> np.ndarray:
-    n = len(ALL_FEATURES)
-    dummy = np.zeros((len(values), n + 1))
+    dummy = np.zeros((len(values), len(ALL_FEATURES) + 1))
     dummy[:, -1] = values.flatten()
     return scaler.inverse_transform(dummy)[:, -1]
 
 
-def predict(csv_path: str, model=None, scaler=None, features=None) -> pd.DataFrame:
+def predict(source, model=None, scaler=None, features=None) -> pd.DataFrame:
+    """
+    source: file path (str), raw bytes, or file-like object
+    """
     if model is None or scaler is None or features is None:
         model, scaler, features = load_artifacts()
 
-    raw_df = pd.read_csv(csv_path, low_memory=False)
-    df     = preprocess_upload(raw_df, scaler, features)
+    raw_df = _load_csv(source)
+    df     = preprocess(raw_df, scaler, features)
 
     if len(df) < SEQUENCE_LEN + 1:
-        raise ValueError(f"Need at least {SEQUENCE_LEN + 1} rows. Got {len(df)}.")
+        raise ValueError(
+            f"Need at least {SEQUENCE_LEN + 1} rows after cleaning. Got {len(df)}. "
+            "Upload a larger file."
+        )
 
-    X = make_sequences(df, features)
-
-    # ONNX inference — input name is 'input'
-    input_name  = model.get_inputs()[0].name
-    preds_norm  = model.run(None, {input_name: X})[0].flatten()
-    preds_mgL   = inverse_do(scaler, preds_norm)
+    X          = make_sequences(df, features)
+    input_name = model.get_inputs()[0].name
+    preds_norm = model.run(None, {input_name: X})[0].flatten()
+    preds_mgL  = inverse_do(scaler, preds_norm)
 
     actual_col = df[TARGET].values[SEQUENCE_LEN:] if TARGET in df.columns else None
     actual_mgL = inverse_do(scaler, actual_col) if actual_col is not None else None
@@ -91,14 +109,7 @@ def predict(csv_path: str, model=None, scaler=None, features=None) -> pd.DataFra
 
 
 if __name__ == "__main__":
-    raw = pd.read_csv(
-        os.path.join(PROJECT_ROOT, "data", "raw", "aquaculture_data.csv"),
-        low_memory=False
-    ).dropna().head(500)
-    sample_path = os.path.join(PROJECT_ROOT, "data", "processed", "sample_test.csv")
-    raw.to_csv(sample_path, index=False)
-
-    result = predict(sample_path)
-    alerts = result["alert"].sum()
+    sample = os.path.join(PROJECT_ROOT, "data", "raw", "aquaculture_data.csv")
+    result = predict(sample)
     print(result.head(10).to_string(index=False))
-    print(f"\n[alerts] {alerts} / {len(result)} predictions below {DO_THRESHOLD} mg/L")
+    print(f"\nAlerts: {result['alert'].sum()} / {len(result)}")
