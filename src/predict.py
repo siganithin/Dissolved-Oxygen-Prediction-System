@@ -1,31 +1,31 @@
 """
-Inference pipeline — zero sklearn dependency at runtime.
-Scaling is done manually with saved numpy arrays.
+Inference pipeline.
+Zero sklearn / joblib dependency at runtime — uses numpy arrays + JSON.
+Works on any Python version / any package version.
 """
 import io
 import os
+import json
+import traceback
 import warnings
 warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
-import joblib
 import onnxruntime as rt
 
 PROJECT_ROOT  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 MODEL_PATH    = os.path.join(PROJECT_ROOT, "models", "bisru_model.onnx")
-FEATURES_PATH = os.path.join(PROJECT_ROOT, "models", "selected_features.pkl")
+FEATURES_PATH = os.path.join(PROJECT_ROOT, "models", "selected_features.json")
 SCALER_MIN    = os.path.join(PROJECT_ROOT, "models", "scaler_min.npy")
 SCALER_SCALE  = os.path.join(PROJECT_ROOT, "models", "scaler_scale.npy")
-SCALER_MAX    = os.path.join(PROJECT_ROOT, "models", "scaler_max.npy")
 
 TARGET       = "dissolved_oxygen"
 DO_THRESHOLD = 5.0
 SEQUENCE_LEN = 24
 ALL_FEATURES = ["temperature", "pH", "BOD", "ammonia", "nitrate", "nitrogen"]
-# column order the scaler was fit on: 6 features + target
-SCALER_COLS  = ALL_FEATURES + [TARGET]
+SCALER_COLS  = ALL_FEATURES + [TARGET]   # order scaler was fit on
 
 COL_MAP = {
     "Temperature (cel)"                : "temperature",
@@ -39,30 +39,16 @@ COL_MAP = {
 }
 
 
-class NumpyScaler:
-    """MinMaxScaler reimplemented with pure numpy — no sklearn needed."""
-    def __init__(self, min_path, scale_path):
-        self.data_min_ = np.load(min_path)
-        self.scale_    = np.load(scale_path)
-
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        return (X - self.data_min_) * self.scale_
-
-    def inverse_col(self, values: np.ndarray, col_idx: int) -> np.ndarray:
-        """Inverse-transform a single column by index."""
-        return values / self.scale_[col_idx] + self.data_min_[col_idx]
-
-
 def load_artifacts():
-    sess     = rt.InferenceSession(MODEL_PATH)
-    scaler   = NumpyScaler(SCALER_MIN, SCALER_SCALE)
-    features = joblib.load(FEATURES_PATH)
-    return sess, scaler, features
+    sess       = rt.InferenceSession(MODEL_PATH)
+    data_min   = np.load(SCALER_MIN)
+    scale      = np.load(SCALER_SCALE)
+    with open(FEATURES_PATH) as f:
+        features = json.load(f)
+    return sess, (data_min, scale), features
 
 
 def _read_csv(source) -> pd.DataFrame:
-    if isinstance(source, (str, os.PathLike)):
-        return pd.read_csv(source, low_memory=False)
     if isinstance(source, bytes):
         return pd.read_csv(io.BytesIO(source), low_memory=False)
     return pd.read_csv(source, low_memory=False)
@@ -72,66 +58,57 @@ def predict(source, model=None, scaler=None, features=None) -> pd.DataFrame:
     if model is None or scaler is None or features is None:
         model, scaler, features = load_artifacts()
 
+    data_min, scale = scaler
+
     raw_df = _read_csv(source)
     df = raw_df.rename(columns=COL_MAP)
 
     has_target = TARGET in df.columns
-    needed = ALL_FEATURES + ([TARGET] if has_target else [])
-    df = df[[c for c in needed if c in df.columns]].copy()
+    needed     = ALL_FEATURES + ([TARGET] if has_target else [])
+    df         = df[[c for c in needed if c in df.columns]].copy()
 
-    # Fill missing feature values
+    # Fill NaN in features
     for col in ALL_FEATURES:
         if col in df.columns:
-            df[col] = df[col].fillna(df[col].median())
+            med = df[col].median()
+            df[col] = df[col].fillna(med)
 
     if len(df) < SEQUENCE_LEN + 1:
         raise ValueError(
-            f"Need at least {SEQUENCE_LEN + 1} rows. Got {len(df)}. Upload a larger file."
+            f"Need at least {SEQUENCE_LEN + 1} rows after cleaning. "
+            f"Got {len(df)}. Please upload a larger CSV file."
         )
 
-    # Scale using numpy arrays — col order must match SCALER_COLS
-    cols_to_scale = ALL_FEATURES + ([TARGET] if has_target else [])
-    scale_indices = [SCALER_COLS.index(c) for c in cols_to_scale]
-
-    arr = df[cols_to_scale].values.astype(np.float64)
-    for i, idx in enumerate(scale_indices):
-        arr[:, i] = (arr[:, i] - scaler.data_min_[idx]) * scaler.scale_[idx]
-
-    df_scaled = pd.DataFrame(arr, columns=cols_to_scale)
+    # Manual MinMax scale — no sklearn
+    cols_present = ALL_FEATURES + ([TARGET] if has_target else [])
+    arr = df[cols_present].values.astype(np.float64)
+    for i, col in enumerate(cols_present):
+        idx = SCALER_COLS.index(col)
+        arr[:, i] = (arr[:, i] - data_min[idx]) * scale[idx]
 
     # Build sequences
-    feat_vals = df_scaled[features].values.astype(np.float32)
-    X = np.array(
-        [feat_vals[i: i + SEQUENCE_LEN] for i in range(len(df_scaled) - SEQUENCE_LEN)],
-        dtype=np.float32
-    )
+    feat_idx  = [cols_present.index(f) for f in features]
+    feat_arr  = arr[:, feat_idx].astype(np.float32)
+    X = np.stack([feat_arr[i: i + SEQUENCE_LEN]
+                  for i in range(len(feat_arr) - SEQUENCE_LEN)]).astype(np.float32)
 
     # ONNX inference
-    input_name = model.get_inputs()[0].name
-    preds_norm = model.run(None, {input_name: X})[0].flatten()
+    inp_name   = model.get_inputs()[0].name
+    preds_norm = model.run(None, {inp_name: X})[0].flatten()
 
-    # Inverse-transform predictions (DO is last column = index 6)
-    do_idx      = SCALER_COLS.index(TARGET)
-    do_min      = scaler.data_min_[do_idx]
-    do_scale    = scaler.scale_[do_idx]
-    preds_mgL   = preds_norm / do_scale + do_min
+    # Inverse-transform DO
+    do_idx   = SCALER_COLS.index(TARGET)
+    preds_mgL = preds_norm / scale[do_idx] + data_min[do_idx]
 
     result = pd.DataFrame({
-        "index"        : range(len(preds_mgL)),
-        "predicted_DO" : np.round(preds_mgL, 3),
+        "index"        : np.arange(len(preds_mgL)),
+        "predicted_DO" : np.round(preds_mgL.astype(float), 3),
         "alert"        : preds_mgL < DO_THRESHOLD,
     })
 
     if has_target:
-        actual_norm = df_scaled[TARGET].values[SEQUENCE_LEN:]
-        actual_mgL  = actual_norm / do_scale + do_min
-        result["actual_DO"] = np.round(actual_mgL, 3)
+        do_col_idx = cols_present.index(TARGET)
+        actual_mgL = arr[SEQUENCE_LEN:, do_col_idx] / scale[do_idx] + data_min[do_idx]
+        result["actual_DO"] = np.round(actual_mgL.astype(float), 3)
 
     return result
-
-
-if __name__ == "__main__":
-    sample = os.path.join(PROJECT_ROOT, "data", "raw", "aquaculture_data.csv")
-    r = predict(sample)
-    print(r.head(10).to_string(index=False))
-    print(f"\nAlerts: {r['alert'].sum()} / {len(r)}")
